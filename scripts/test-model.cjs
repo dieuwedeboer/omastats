@@ -221,3 +221,59 @@ test("shells without a saved bar config still persist inline settings", () => {
   assert.equal(savedEntry().barDisks, "nvme1n1:used");
   assert.equal(widget.settings.graphWidth, 48);
 });
+
+test("ZFS datasets leave out pure containers and split used into data and snapshots", () => {
+  const zfs = { datasets: [
+    { name: "tank", mount: "", used: 1000e9, usedByDataset: 196608, usedBySnapshots: 0, usedByChildren: 1000e9, compressRatio: 1.2 },
+    { name: "tank/home", mount: "/home", used: 716e9, usedByDataset: 516e9, usedBySnapshots: 200e9, usedByChildren: 0, compressRatio: 1.18 },
+    { name: "tank/root", mount: "/", used: 179e9, usedByDataset: 179e9, usedBySnapshots: 0, usedByChildren: 0, compressRatio: 1.74 },
+  ] };
+  const rows = model.zfsDatasets(zfs);
+  assert.deepEqual(plain(rows.map(row => row.name)), ["tank/home", "tank/root"]);
+  assert.equal(rows[0].dataShare + rows[0].snapshotShare, 1);
+  assert.equal(rows[1].dataShare, 0.25);
+  assert.equal(model.zfsSnapshotSpace(zfs), 200e9);
+  assert.equal(model.datasetLabel(rows[0]), "/home");
+  assert.equal(model.datasetLabel({ name: "tank/ROOT/other", mount: "" }), "other");
+  assert.deepEqual(plain(model.zfsDatasets(null)), []);
+});
+
+test("ZFS section toggles appear only where a ZFS dataset is mounted", () => {
+  const keys = snapshot => plain(model.panelSections("disks", snapshot).map(section => section.key));
+  const zfs = { disks: { volumes: [{ mount: "/", fstype: "zfs" }] } };
+  const ext4 = { disks: { volumes: [{ mount: "/", fstype: "ext4" }] } };
+  assert.deepEqual(keys(ext4), ["showVolumes", "showActivity"]);
+  assert.deepEqual(keys(zfs), ["showVolumes", "showActivity", "showDatasets", "showSnapshots"]);
+  assert.equal(model.flag({}, "showDatasets"), true);
+  assert.equal(model.flag({ showSnapshots: false }, "showSnapshots"), false);
+});
+
+test("du output becomes the largest direct children and the scanned total", () => {
+  const records = ["4096\t/home/a/.cache", "900\t/home/a/docs", "5\t/home/a/docs/deep",
+    "12\t/elsewhere", "bad\t/home/a/x", "no tab", "6000\t/home/a"];
+  const result = model.duEntries(records, "/home/a");
+  assert.equal(result.total, 6000);
+  assert.deepEqual(plain(result.entries), [
+    { path: "/home/a/.cache", name: ".cache", size: 4096 },
+    { path: "/home/a/docs", name: "docs", size: 900 }]);
+  assert.deepEqual(plain(model.duEntries(["7\t/usr", "9\t/"], "/")),
+    { entries: [{ path: "/usr", name: "usr", size: 7 }], total: 9 });
+  assert.equal(model.duEntries(["1\t/home/a/x"], "/home/a").total, null);
+});
+
+test("moving up a directory scan stops at the dataset's mount point", () => {
+  assert.equal(model.parentWithin("/home/a/docs", "/home"), "/home/a");
+  assert.equal(model.parentWithin("/home/a", "/home"), "/home");
+  assert.equal(model.parentWithin("/home", "/home"), "");
+  assert.equal(model.parentWithin("/usr", "/"), "/");
+  assert.equal(model.parentWithin("/homework/x", "/home"), "");
+});
+
+test("snapshot ages read as compact units", () => {
+  const now = 1_800_000_000;
+  assert.equal(model.ageText(now - 120, now), "2m");
+  assert.equal(model.ageText(now - 5 * 3600, now), "5h");
+  assert.equal(model.ageText(now - 3 * 86400, now), "3d");
+  assert.equal(model.ageText(now - 21 * 86400, now), "3w");
+  assert.equal(model.ageText(now - 120 * 86400, now), "4mo");
+});

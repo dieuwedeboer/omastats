@@ -149,6 +149,88 @@ Item {
     else publicIpPending = true
   }
 
+  // Directory sizes for the Disks page, listed on request with du. This runs
+  // beside the sampler, not in it: walking a large dataset takes a minute or
+  // more. One scan runs at a time; results are kept per directory so moving
+  // back up does not walk it again.
+  property string scanRoot: ""
+  property string scanPath: ""
+  property string scanRunningPath: ""
+  property string scanPending: ""
+  property var scanResults: ({})
+  property var scanRecords: []
+  property real scanStarted: 0
+  property bool gduAvailable: false
+  property bool gduChecked: false
+  readonly property bool scanRunning: scanRunningPath !== ""
+  readonly property var scanResult: scanResults[scanPath] || null
+
+  // Scan `path`, a directory inside the dataset mounted at `rootPath`. A
+  // result already in hand is shown again unless `force` asks for a rescan.
+  function scanDirectory(path, rootPath, force) {
+    var target = String(path || "")
+    if (!target || target.charAt(0) !== "/") return
+    if (rootPath !== undefined) scanRoot = String(rootPath || target)
+    scanPath = target
+    if (!gduChecked) {
+      gduChecked = true
+      gduCheck.running = true
+    }
+    if (!force && scanResults[target]) return
+    if (scanRunningPath === target) return
+    if (duProcess.running) {
+      scanPending = target
+      duProcess.running = false
+      return
+    }
+    startScan(target)
+  }
+
+  function startScan(target) {
+    scanRecords = []
+    scanRunningPath = target
+    scanStarted = Date.now()
+    duProcess.command = ["/usr/bin/du", "-x", "-0", "--block-size=1", "--max-depth=1", "--", target]
+    duProcess.running = true
+  }
+
+  function finishScan(code, status) {
+    var path = scanRunningPath
+    var records = scanRecords
+    scanRunningPath = ""
+    scanRecords = []
+    if (scanPending) {
+      var next = scanPending
+      scanPending = ""
+      startScan(next)
+      return
+    }
+    if (!path) return
+    var parsed = Model.duEntries(records, path)
+    var results = {}
+    for (var key in scanResults) results[key] = scanResults[key]
+    results[path] = {
+      entries: parsed.entries,
+      total: parsed.total,
+      // du exits 1 when it could not read some directories; the sizes it did
+      // print are still right for what it could read.
+      incomplete: code !== 0,
+      truncated: records.length >= 20000,
+      failed: parsed.total === null,
+      stamp: Date.now()
+    }
+    scanResults = results
+  }
+
+  function closeScan() {
+    scanPending = ""
+    scanRunningPath = ""
+    if (duProcess.running) duProcess.running = false
+    scanPath = ""
+    scanRoot = ""
+    scanResults = ({})
+  }
+
   // Every bar instance reports its settings; the sampler runs at the fastest
   // requested interval and keeps the longest requested history.
   function registerSettings(key, settings) {
@@ -260,6 +342,29 @@ Item {
     }
   }
 
+  Process {
+    id: duProcess
+    clearEnvironment: true
+    environment: ({ "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8" })
+    // du names each directory with a trailing NUL, so names holding a newline
+    // stay whole. Unreadable directories are reported on stderr, left unbound.
+    stdout: SplitParser {
+      splitMarker: "\u0000"
+      onRead: function(record) {
+        if (root.scanRecords.length < 20000) root.scanRecords.push(String(record))
+      }
+    }
+    onExited: function(code, status) { root.finishScan(code, status) }
+  }
+
+  // gdu is offered for a closer look only when it is installed.
+  Process {
+    id: gduCheck
+    command: ["/usr/bin/test", "-x", "/usr/bin/gdu"]
+    clearEnvironment: true
+    onExited: function(code, status) { root.gduAvailable = code === 0 }
+  }
+
   Timer {
     id: restartTimer
     repeat: false
@@ -296,6 +401,7 @@ Item {
   Component.onDestruction: {
     root.destroying = true
     restartTimer.stop()
+    if (duProcess.running) duProcess.running = false
     if (sampler.running) {
       sampler.write("quit\n")
       sampler.running = false

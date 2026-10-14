@@ -391,7 +391,7 @@ Column {
         readonly property string pageId: String(root.pages[index] || "")
         readonly property var def: Model.moduleDef(pageId)
         readonly property bool enabled: root.tabModules.indexOf(pageId) !== -1
-        readonly property var sections: Model.PANEL_SECTIONS[pageId] || []
+        readonly property var sections: Model.panelSections(pageId, root.snapshot)
         readonly property var choices: Model.PANEL_CHOICES[pageId] || []
 
         width: parent.width

@@ -44,7 +44,7 @@ var SETTINGS = {
   showProcesses: true,
   showCores: true, showLoad: true,
   showBreakdown: true,
-  showVolumes: true, showActivity: true,
+  showVolumes: true, showActivity: true, showDatasets: true, showSnapshots: true,
   showInterfaces: true, showTotals: true, showAddresses: true,
   showTemperatures: true, showFans: true,
   showHistory: true, showDetails: true, showDevices: true
@@ -61,7 +61,9 @@ var PANEL_SECTIONS = {
   ],
   disks: [
     { key: "showVolumes", label: "Volumes" },
-    { key: "showActivity", label: "Read and write activity" }
+    { key: "showActivity", label: "Read and write activity" },
+    { key: "showDatasets", label: "ZFS datasets", zfs: true },
+    { key: "showSnapshots", label: "ZFS snapshots", zfs: true }
   ],
   network: [
     { key: "showInterfaces", label: "Interfaces" },
@@ -78,6 +80,14 @@ var PANEL_SECTIONS = {
     { key: "showDetails", label: "Details" },
     { key: "showDevices", label: "Devices" }
   ]
+}
+
+// A page's section toggles on this machine: ZFS sections only where a ZFS
+// dataset is mounted.
+function panelSections(page, snapshot) {
+  var sections = PANEL_SECTIONS[page] || []
+  var zfs = hasZfs(snapshot)
+  return sections.filter(function(section) { return !section.zfs || zfs })
 }
 
 // Multiple-choice options per page, shown after that page's toggles.
@@ -359,6 +369,117 @@ function diskUsage(snapshot, disk) {
     }
   }
   return { used: used, size: size, fraction: size > 0 ? clamp(used / size, 0, 1) : 0 }
+}
+
+// ------------------------------------------------------------------- zfs
+
+function hasZfs(snapshot) {
+  var disks = (snapshot || {}).disks || {}
+  var volumes = Array.isArray(disks.volumes) ? disks.volumes : []
+  for (var i = 0; i < volumes.length; i++) if (volumes[i] && volumes[i].fstype === "zfs") return true
+  return false
+}
+
+// Datasets worth a row, largest first, with each part of "used" as a share of
+// the largest row so the bars compare across rows. A dataset that only holds
+// other datasets (under 1 MB of its own data and snapshots) adds nothing its
+// children do not already show.
+function zfsDatasets(zfs) {
+  var list = zfs && Array.isArray(zfs.datasets) ? zfs.datasets : []
+  var rows = []
+  for (var i = 0; i < list.length; i++) {
+    var d = list[i] || {}
+    var data = num(d.usedByDataset)
+    var snaps = num(d.usedBySnapshots)
+    var children = num(d.usedByChildren)
+    if (children > 0 && data + snaps < 1048576) continue
+    rows.push({
+      name: String(d.name || ""),
+      mount: String(d.mount || ""),
+      used: num(d.used),
+      data: data,
+      snapshots: snaps,
+      children: children,
+      referenced: num(d.referenced),
+      ratio: num(d.compressRatio, 1)
+    })
+  }
+  rows.sort(function(a, b) { return b.used - a.used || (a.name < b.name ? -1 : 1) })
+  var top = rows.length > 0 ? rows[0].used : 0
+  for (var j = 0; j < rows.length; j++) {
+    var r = rows[j]
+    r.dataShare = top > 0 ? r.data / top : 0
+    r.snapshotShare = top > 0 ? r.snapshots / top : 0
+    r.childShare = top > 0 ? r.children / top : 0
+  }
+  return rows
+}
+
+// Bytes held by every listed dataset's snapshots. Each counts the blocks that
+// only snapshots keep, including blocks several snapshots share.
+function zfsSnapshotSpace(zfs) {
+  var list = zfs && Array.isArray(zfs.datasets) ? zfs.datasets : []
+  var total = 0
+  for (var i = 0; i < list.length; i++) total += num(list[i] && list[i].usedBySnapshots)
+  return total
+}
+
+// The name a dataset row leads with: where it is mounted, else its last
+// path component.
+function datasetLabel(row) {
+  if (row && row.mount) return row.mount
+  var name = String(row && row.name || "")
+  return name.split("/").pop() || name
+}
+
+// "3d", "5w", "4mo": how long ago a Unix time was, for snapshot rows.
+function ageText(epochSeconds, nowSeconds) {
+  var age = Math.max(0, num(nowSeconds) - num(epochSeconds))
+  if (age < 3600) return Math.max(1, Math.round(age / 60)) + "m"
+  if (age < 172800) return Math.round(age / 3600) + "h"
+  if (age < 1209600) return Math.round(age / 86400) + "d"
+  if (age < 7862400) return Math.round(age / 604800) + "w"
+  if (age < 63072000) return Math.round(age / 2629800) + "mo"
+  return Math.round(age / 31557600) + "y"
+}
+
+// ---------------------------------------------------------- directory sizes
+
+// The directories du reports one level under `path`, largest first, as
+// {path, name, size}, plus the size of `path` itself. du prints the scanned
+// directory last; anything not directly under it is ignored.
+function duEntries(records, path) {
+  var base = String(path || "")
+  var prefix = base === "/" ? "/" : base + "/"
+  var entries = []
+  var total = null
+  var list = Array.isArray(records) ? records : []
+  for (var i = 0; i < list.length; i++) {
+    var record = String(list[i] || "")
+    var tab = record.indexOf("\t")
+    if (tab <= 0) continue
+    var size = record.slice(0, tab)
+    var where = record.slice(tab + 1)
+    if (!/^[0-9]+$/.test(size)) continue
+    if (where === base) { total = Number(size); continue }
+    if (where.indexOf(prefix) !== 0) continue
+    var name = where.slice(prefix.length)
+    if (!name || name.indexOf("/") !== -1) continue
+    entries.push({ path: where, name: name, size: Number(size) })
+  }
+  entries.sort(function(a, b) { return b.size - a.size || (a.name < b.name ? -1 : 1) })
+  return { entries: entries, total: total }
+}
+
+// One directory up from `path`, or "" once `path` is the scan's root.
+function parentWithin(path, root) {
+  var p = String(path || "")
+  var r = String(root || "")
+  if (!p || !r || p === r) return ""
+  if (r !== "/" && p.indexOf(r + "/") !== 0) return ""
+  var cut = p.lastIndexOf("/")
+  var parent = cut <= 0 ? "/" : p.slice(0, cut)
+  return parent.length < r.length ? r : parent
 }
 
 // ------------------------------------------------------------- processes

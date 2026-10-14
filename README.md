@@ -20,7 +20,7 @@ OmaStats is an independent project and is not affiliated with Bjango.
 | CPU     | glyph · user/system history · %     | User/system history, per-core rings, load, uptime, top processes |
 | GPU     | one readout per GPU · history · %   | Its own tab, with aligned load and VRAM histories when reported |
 | Memory  | glyph · used history · %            | Swap and memory rings, breakdown, processes                           |
-| Disks   | per disk: read/write history and rates, space used | Volumes (click to open in Files), activity for all disks or one, processes |
+| Disks   | per disk: read/write history and rates, space used | Volumes (click to open in Files), activity for all disks or one, ZFS datasets, snapshots and directory sizes, processes |
 | Network | glyph · up/down history · rates     | Upload/download, interfaces, public and local IPs, traffic per process |
 | Sensors | any temperatures and fans you pick  | CPU/GPU/fan rings, every hwmon temperature and fan                    |
 | Battery | glyph by level · %                  | Charge and health rings, charge history, power, cycles, peripherals   |
@@ -88,7 +88,9 @@ AMD and Intel come from sysfs), `ip` and `iw` (addresses, Wi-Fi signal),
 `ss` from iproute2 (per-process network traffic), `zfs` and `zpool` (a ZFS
 pool's space and the drive behind its first data vdev, shown as one volume at
 its shortest mount path; without them the space is that dataset's), `curl` (public IP lookup),
-`wl-copy` (copy an address), `xdg-open` (open a volume in your file manager).
+`wl-copy` (copy an address), `xdg-open` (open a volume in your file manager),
+`du` from coreutils (directory sizes inside a ZFS dataset, on request), `gdu`
+(an "Open in gdu" link beside those sizes, shown only when `/usr/bin/gdu` exists).
 
 Nothing runs as root, and no data leaves the machine except the optional
 public-IP lookup, which you can switch off in Settings. That lookup tries
@@ -167,6 +169,7 @@ Setup → Plugins:
 | `showCores`, `showLoad`   | `true`                                    | CPU page sections                                         |
 | `showBreakdown`           | `true`                                    | Memory breakdown                                          |
 | `showVolumes`, `showActivity` | `true`                                | Disks page sections                                       |
+| `showDatasets`, `showSnapshots` | `true`                              | Disks page ZFS sections, offered only when a ZFS dataset is mounted |
 | `showInterfaces`, `showTotals`, `showAddresses` | `true`              | Network page sections                                     |
 | `showTemperatures`, `showFans` | `true`                               | Sensors page sections                                     |
 | `showHistory`, `showDetails`, `showDevices` | `true`                  | Battery page sections                                     |
@@ -187,6 +190,26 @@ Several instances are allowed, so modules can be spread across the bar:
   bar panel, `Esc` closes, `r` refreshes.
 - Addresses on the Network page copy to the clipboard when clicked. Volumes on
   the Disks page open in the file manager.
+- A mounted ZFS dataset on the Disks page lists its largest directories when
+  clicked; click one to go a level down, or Up to go back.
+
+## ZFS
+
+With a ZFS dataset mounted, the Disks page adds two cards while it is open:
+
+- **Datasets**: each filesystem dataset, largest first, with a bar splitting
+  what it uses into its own data and the space its snapshots hold. Datasets
+  that only contain other datasets are left out.
+- **Snapshots**: the 15 snapshots that would free the most space if deleted on
+  their own. A snapshot's size counts only blocks no other snapshot shares, so
+  together they add up to less than the snapshot space on the Datasets card.
+
+Both come from `zfs list`, refreshed at most every 30 seconds and only while
+the Disks page is open. Clicking a mounted dataset runs
+`du -x --max-depth=1` on it in the background and lists its largest
+directories, one level at a time. A large dataset can take a minute or more.
+Directories you cannot read are left out of the sizes, and the card says so.
+Machines without ZFS see none of this.
 
 The sampler reads cheap counters at the chosen interval and everything that
 walks many files (processes, sensors, battery, socket mapping) at most once a
