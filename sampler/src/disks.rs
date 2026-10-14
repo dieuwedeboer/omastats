@@ -6,6 +6,7 @@ use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 const REAL_FS: [&str; 24] = [
@@ -15,6 +16,11 @@ const REAL_FS: [&str; 24] = [
 ];
 const VOLUME_LIMIT: usize = 256;
 const PATH_TEXT_LIMIT: usize = 4096;
+/// Datasets and snapshots are listed at most this often, and only while the
+/// Disks page is open.
+const ZFS_DETAIL_SECONDS: f64 = 30.0;
+const DATASET_LIMIT: usize = 64;
+const SNAPSHOT_LIMIT: usize = 15;
 
 #[derive(Clone)]
 struct Volume {
@@ -35,6 +41,16 @@ pub struct DiskSampler {
     volumes: Vec<Volume>,
     volumes_stamp: f64,
     drive_temps: HashMap<String, String>,
+    zfs_mounted: bool,
+    zfs_detail: Arc<Mutex<ZfsDetail>>,
+}
+
+/// The last dataset and snapshot listing, refreshed off the sampling thread.
+#[derive(Default)]
+struct ZfsDetail {
+    value: Value,
+    stamp: f64,
+    inflight: bool,
 }
 
 fn statvfs(path: &str) -> Option<(u64, u64, u64)> {
@@ -134,6 +150,174 @@ fn parse_zpool_leaves(raw: &str) -> HashMap<String, String> {
     leaves
 }
 
+/// One filesystem dataset from `zfs list -Hp -t filesystem`.
+#[derive(Debug, PartialEq)]
+struct Dataset {
+    name: String,
+    used: u64,
+    by_dataset: u64,
+    by_snapshots: u64,
+    by_children: u64,
+    referenced: u64,
+    ratio: f64,
+}
+
+/// Parse `zfs list -Hp -t filesystem -o name,used,usedbydataset,usedbysnapshots,
+/// usedbychildren,referenced,compressratio`, largest first.
+fn parse_zfs_datasets(raw: &str) -> Vec<Dataset> {
+    let mut list: Vec<Dataset> = raw
+        .lines()
+        .filter_map(|line| {
+            let fields: Vec<&str> = line.split('\t').collect();
+            if fields.len() < 7 {
+                return None;
+            }
+            let name = fields[0];
+            if name.is_empty() || name.len() > PATH_TEXT_LIMIT || name.contains('@') {
+                return None;
+            }
+            let ratio = fields[6].trim_end_matches('x');
+            if ratio.is_empty() || !ratio.bytes().all(|b| b.is_ascii_digit() || b == b'.') {
+                return None;
+            }
+            Some(Dataset {
+                name: name.to_string(),
+                used: parse_bytes(fields[1])?,
+                by_dataset: parse_bytes(fields[2])?,
+                by_snapshots: parse_bytes(fields[3])?,
+                by_children: parse_bytes(fields[4])?,
+                referenced: parse_bytes(fields[5])?,
+                ratio: ratio.parse().ok().filter(|r: &f64| r.is_finite())?,
+            })
+        })
+        .collect();
+    list.sort_by(|a, b| b.used.cmp(&a.used).then_with(|| a.name.cmp(&b.name)));
+    list
+}
+
+/// One snapshot from `zfs list -Hp -t snapshot`.
+#[derive(Debug, PartialEq)]
+struct Snapshot {
+    dataset: String,
+    name: String,
+    used: u64,
+    referenced: u64,
+    creation: u64,
+}
+
+/// Parse `zfs list -Hp -t snapshot -o name,used,referenced,creation` into the
+/// largest snapshots, plus how many there are and the bytes they hold alone.
+fn parse_zfs_snapshots(raw: &str, limit: usize) -> (Vec<Snapshot>, usize, u64) {
+    let mut list: Vec<Snapshot> = raw
+        .lines()
+        .filter_map(|line| {
+            let fields: Vec<&str> = line.split('\t').collect();
+            if fields.len() < 4 || fields[0].len() > PATH_TEXT_LIMIT {
+                return None;
+            }
+            let (dataset, name) = fields[0].split_once('@')?;
+            if dataset.is_empty() || name.is_empty() {
+                return None;
+            }
+            Some(Snapshot {
+                dataset: dataset.to_string(),
+                name: name.to_string(),
+                used: parse_bytes(fields[1])?,
+                referenced: parse_bytes(fields[2])?,
+                creation: parse_bytes(fields[3])?,
+            })
+        })
+        .collect();
+    let count = list.len();
+    let unique = list.iter().fold(0u64, |sum, s| sum.saturating_add(s.used));
+    list.sort_by(|a, b| {
+        b.used
+            .cmp(&a.used)
+            .then_with(|| b.creation.cmp(&a.creation))
+    });
+    list.truncate(limit);
+    (list, count, unique)
+}
+
+/// Where each mounted ZFS dataset is mounted, at its shortest path.
+fn zfs_mounts(mounts: &str) -> HashMap<String, String> {
+    let mut found: HashMap<String, String> = HashMap::new();
+    for line in mounts.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 3 || zfs_pool(parts[2], parts[0]).is_none() {
+            continue;
+        }
+        let mount = parts[1].replace("\\040", " ");
+        if mount.len() > PATH_TEXT_LIMIT {
+            continue;
+        }
+        let keep = found
+            .get(parts[0])
+            .is_none_or(|existing| mount.len() < existing.len());
+        if keep {
+            found.insert(parts[0].to_string(), mount);
+        }
+    }
+    found
+}
+
+/// Datasets and the largest snapshots of every imported pool.
+fn list_zfs_detail(now: f64) -> Value {
+    let mounts = zfs_mounts(&read_text("/proc/self/mounts").unwrap_or_default());
+    let mut datasets = parse_zfs_datasets(&run(
+        "zfs",
+        &[
+            "list",
+            "-Hp",
+            "-t",
+            "filesystem",
+            "-o",
+            "name,used,usedbydataset,usedbysnapshots,usedbychildren,referenced,compressratio",
+        ],
+        Duration::from_secs(10),
+    ));
+    let dataset_count = datasets.len();
+    datasets.truncate(DATASET_LIMIT);
+    let (snapshots, snapshot_count, snapshot_used) = parse_zfs_snapshots(
+        &run(
+            "zfs",
+            &[
+                "list",
+                "-Hp",
+                "-t",
+                "snapshot",
+                "-o",
+                "name,used,referenced,creation",
+            ],
+            Duration::from_secs(10),
+        ),
+        SNAPSHOT_LIMIT,
+    );
+    json!({
+        "stamp": now,
+        "datasetCount": dataset_count,
+        "datasets": datasets.iter().map(|d| json!({
+            "name": d.name,
+            "mount": mounts.get(&d.name).cloned().unwrap_or_default(),
+            "used": d.used,
+            "usedByDataset": d.by_dataset,
+            "usedBySnapshots": d.by_snapshots,
+            "usedByChildren": d.by_children,
+            "referenced": d.referenced,
+            "compressRatio": d.ratio,
+        })).collect::<Vec<_>>(),
+        "snapshotCount": snapshot_count,
+        "snapshotUsed": snapshot_used,
+        "snapshots": snapshots.iter().map(|s| json!({
+            "dataset": s.dataset,
+            "name": s.name,
+            "used": s.used,
+            "referenced": s.referenced,
+            "creation": s.creation,
+        })).collect::<Vec<_>>(),
+    })
+}
+
 fn parent_disk(device: &str) -> String {
     let real = std::fs::canonicalize(device)
         .map(|p| p.to_string_lossy().to_string())
@@ -184,6 +368,8 @@ impl DiskSampler {
             volumes: Vec::new(),
             volumes_stamp: 0.0,
             drive_temps: HashMap::new(),
+            zfs_mounted: false,
+            zfs_detail: Arc::new(Mutex::new(ZfsDetail::default())),
         };
         sampler.scan_drive_temps();
         sampler
@@ -229,14 +415,15 @@ impl DiskSampler {
         }
     }
 
-    fn scan_volumes(&self) -> Vec<Volume> {
+    fn scan_volumes(&mut self) -> Vec<Volume> {
         let mut volumes: HashMap<String, Volume> = HashMap::new();
         let mounts = read_text("/proc/self/mounts").unwrap_or_default();
-        let zfs = if mounts.lines().any(|line| {
+        self.zfs_mounted = mounts.lines().any(|line| {
             let mut parts = line.split_whitespace();
             let device = parts.next().unwrap_or_default();
             zfs_pool(parts.nth(1).unwrap_or_default(), device).is_some()
-        }) {
+        });
+        let zfs = if self.zfs_mounted {
             ZfsPools::query()
         } else {
             ZfsPools::default()
@@ -332,7 +519,31 @@ impl DiskSampler {
         list
     }
 
-    pub fn sample(&mut self, elapsed: f64, now: f64) -> Value {
+    /// The cached dataset listing, starting a refresh in the background when
+    /// it is older than `ZFS_DETAIL_SECONDS`. Null until the first one lands.
+    fn zfs_detail(&self, now: f64) -> Value {
+        let mut state = match self.zfs_detail.lock() {
+            Ok(s) => s,
+            Err(_) => return Value::Null,
+        };
+        if !state.inflight && (state.stamp == 0.0 || now - state.stamp >= ZFS_DETAIL_SECONDS) {
+            state.inflight = true;
+            let shared = Arc::clone(&self.zfs_detail);
+            std::thread::spawn(move || {
+                let value = list_zfs_detail(crate::util::now_secs());
+                if let Ok(mut state) = shared.lock() {
+                    state.value = value;
+                    state.stamp = crate::util::now_secs();
+                    state.inflight = false;
+                }
+            });
+        }
+        state.value.clone()
+    }
+
+    /// `zfs_wanted` is true while the Disks page is open; ZFS datasets and
+    /// snapshots are listed only then, and only when a dataset is mounted.
+    pub fn sample(&mut self, elapsed: f64, now: f64, zfs_wanted: bool) -> Value {
         if now - self.volumes_stamp > 10.0 {
             self.volumes = self.scan_volumes();
             self.volumes_stamp = now;
@@ -399,11 +610,18 @@ impl DiskSampler {
             })
             .collect();
 
+        let zfs = if zfs_wanted && self.zfs_mounted {
+            self.zfs_detail(now)
+        } else {
+            Value::Null
+        };
+
         json!({
             "volumes": volumes,
             "read": total_read,
             "write": total_write,
             "perDisk": Value::Object(per_disk),
+            "zfs": zfs,
         })
     }
 }
@@ -437,5 +655,61 @@ mod tests {
         assert_eq!(leaves.len(), 2);
         assert_eq!(leaves["tank"], "/dev/sda1");
         assert_eq!(leaves["fast"], "/dev/nvme0n1p2");
+    }
+    #[test]
+    fn datasets_are_largest_first_and_reject_malformed_rows() {
+        let raw = "tank\t900\t100\t0\t800\t100\t1.20\n\
+                   tank/home\t700\t500\t200\t0\t500\t1.18x\n\
+                   tank/bad\t-1\t0\t0\t0\t0\t1.00\n\
+                   tank/short\t1\t1\n\
+                   tank/ratio\t5\t5\t0\t0\t5\t-\n";
+        let datasets = parse_zfs_datasets(raw);
+        assert_eq!(
+            datasets.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(),
+            ["tank", "tank/home"]
+        );
+        let home = &datasets[1];
+        assert_eq!(
+            (
+                home.used,
+                home.by_dataset,
+                home.by_snapshots,
+                home.by_children,
+                home.referenced
+            ),
+            (700, 500, 200, 0, 500)
+        );
+        assert_eq!(home.ratio, 1.18);
+    }
+
+    #[test]
+    fn largest_snapshots_are_kept_and_all_are_counted() {
+        let raw = "tank/home@a\t30\t500\t100\n\
+                   tank/home@b\t10\t510\t200\n\
+                   tank/root@c\t20\t40\t300\n\
+                   tank/root\t20\t40\t300\n\
+                   tank/root@d\tx\t40\t300\n";
+        let (top, count, unique) = parse_zfs_snapshots(raw, 2);
+        assert_eq!((count, unique), (3, 60));
+        assert_eq!(
+            top.iter()
+                .map(|s| (s.dataset.as_str(), s.name.as_str(), s.used))
+                .collect::<Vec<_>>(),
+            [("tank/home", "a", 30), ("tank/root", "c", 20)]
+        );
+        assert_eq!(top[0].creation, 100);
+    }
+
+    #[test]
+    fn mounted_datasets_map_to_their_shortest_mount() {
+        let mounts = "tank/ROOT/root / zfs rw 0 0\n\
+                      tank/ROOT/home /home zfs rw 0 0\n\
+                      tank/ROOT/home /srv/home\\040copy zfs rw 0 0\n\
+                      tank/ROOT/root@daily /.zfs/snapshot/daily zfs ro 0 0\n\
+                      /dev/sda1 /boot vfat rw 0 0\n";
+        let found = zfs_mounts(mounts);
+        assert_eq!(found.len(), 2);
+        assert_eq!(found["tank/ROOT/root"], "/");
+        assert_eq!(found["tank/ROOT/home"], "/home");
     }
 }

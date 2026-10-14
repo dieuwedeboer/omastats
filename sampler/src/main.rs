@@ -7,7 +7,8 @@
 //!
 //! Control lines on stdin:
 //!     detail 0|1|2    0 = none, 1 = top processes, 2 = every process
-//!     focus <page>    page the panel shows; "network" adds per-process traffic
+//!     focus <page>    page the panel shows; "network" adds per-process traffic,
+//!                     "disks" adds ZFS datasets and snapshots
 //!     interval <sec>  change the sampling interval (0.1 – 30)
 //!     pubip           refresh the public IP address in the background
 //!     quit            exit
@@ -150,7 +151,7 @@ fn main() {
     // Prime the delta-based samplers so the first line already carries rates.
     let mut last = Instant::now();
     let _ = cpu.sample();
-    let _ = disks.sample(1.0, util::now_secs());
+    let _ = disks.sample(1.0, util::now_secs(), false);
     let _ = net.sample(1.0, util::now_secs(), detail_flag > 0);
     if detail_flag > 0 {
         let _ = procs.sample(1.0, detail_flag >= 2);
@@ -237,7 +238,7 @@ fn main() {
         payload["gpu"] = gpus.first().cloned().unwrap_or(Value::Null);
         payload["gpus"] = Value::Array(gpus);
         payload["mem"] = mem::sample_memory();
-        payload["disks"] = disks.sample(elapsed, now);
+        payload["disks"] = disks.sample(elapsed, now, focus == "disks");
         let mut network = net.sample(elapsed, now, detail > 0);
         if let Value::Object(map) = &mut network {
             map.insert("procs".to_string(), connections_cache.clone());

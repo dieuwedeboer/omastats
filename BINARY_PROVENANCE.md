@@ -50,7 +50,8 @@ narrow:
 - `ip` for interface addresses, `iw` for Wi-Fi details, and `ss` for TCP socket
   counters;
 - `zfs list` and `zpool list` for ZFS pool space and vdevs, only when a ZFS
-  dataset is mounted; and
+  dataset is mounted, plus datasets and snapshots from `zfs list` at most
+  every 30 seconds while the Disks page is open; and
 - `curl` to one of the three fixed IP-only HTTPS endpoints documented in the
   README, solely when public-IP display is enabled.
 

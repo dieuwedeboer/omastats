@@ -6,7 +6,8 @@ sysfs directly (no psutil) so the only dependency is a Python 3 interpreter.
 
 Control lines on stdin:
     detail 0|1|2    0 = none, 1 = top processes, 2 = every process
-    focus <page>    page the panel shows; "network" adds per-process traffic
+    focus <page>    page the panel shows; "network" adds per-process traffic,
+                    "disks" adds ZFS datasets and snapshots
     interval <sec>  change the sampling interval (0.1 - 30)
     pubip           refresh the public IP address in the background
 
@@ -806,12 +807,122 @@ def parse_zpool_leaves(raw: str) -> dict[str, str]:
     return leaves
 
 
+# Datasets and snapshots are listed at most this often, and only while the
+# Disks page is open.
+ZFS_DETAIL_SECONDS = 30.0
+DATASET_LIMIT = 64
+SNAPSHOT_LIMIT = 15
+
+
+def parse_zfs_datasets(raw: str) -> list[dict]:
+    """Parse `zfs list -Hp -t filesystem -o name,used,usedbydataset,usedbysnapshots,
+    usedbychildren,referenced,compressratio`, largest first."""
+    datasets: list[dict] = []
+    for line in raw.splitlines():
+        fields = line.split("\t")
+        if len(fields) < 7 or not fields[0] or len(fields[0]) > 4096 or "@" in fields[0]:
+            continue
+        if not all(re.fullmatch(r"[0-9]+", field) for field in fields[1:6]):
+            continue
+        ratio = fields[6].removesuffix("x")
+        if not re.fullmatch(r"[0-9.]+", ratio):
+            continue
+        try:
+            compress = float(ratio)
+        except ValueError:
+            continue
+        used, by_dataset, by_snapshots, by_children, referenced = (int(field) for field in fields[1:6])
+        datasets.append({
+            "name": fields[0],
+            "used": used,
+            "usedByDataset": by_dataset,
+            "usedBySnapshots": by_snapshots,
+            "usedByChildren": by_children,
+            "referenced": referenced,
+            "compressRatio": compress,
+        })
+    datasets.sort(key=lambda d: (-d["used"], d["name"]))
+    return datasets
+
+
+def parse_zfs_snapshots(raw: str, limit: int) -> tuple[list[dict], int, int]:
+    """Parse `zfs list -Hp -t snapshot -o name,used,referenced,creation` into the
+    largest snapshots, plus how many there are and the bytes they hold alone."""
+    snapshots: list[dict] = []
+    for line in raw.splitlines():
+        fields = line.split("\t")
+        if len(fields) < 4 or len(fields[0]) > 4096:
+            continue
+        dataset, at, name = fields[0].partition("@")
+        if not at or not dataset or not name:
+            continue
+        if not all(re.fullmatch(r"[0-9]+", field) for field in fields[1:4]):
+            continue
+        snapshots.append({
+            "dataset": dataset,
+            "name": name,
+            "used": int(fields[1]),
+            "referenced": int(fields[2]),
+            "creation": int(fields[3]),
+        })
+    count = len(snapshots)
+    unique = sum(snapshot["used"] for snapshot in snapshots)
+    snapshots.sort(key=lambda s: (-s["used"], -s["creation"]))
+    return snapshots[:limit], count, unique
+
+
+def zfs_mounts(mounts: str) -> dict[str, str]:
+    """Where each mounted ZFS dataset is mounted, at its shortest path."""
+    found: dict[str, str] = {}
+    for line in mounts.splitlines():
+        parts = line.split()
+        if len(parts) < 3 or zfs_pool(parts[2], parts[0]) is None:
+            continue
+        mount = parts[1].replace("\\040", " ")
+        if len(mount) > 4096:
+            continue
+        existing = found.get(parts[0])
+        if existing is None or len(mount) < len(existing):
+            found[parts[0]] = mount
+    return found
+
+
+def list_zfs_detail(now: float) -> dict:
+    """Datasets and the largest snapshots of every imported pool."""
+    mounts = zfs_mounts(read_text("/proc/self/mounts"))
+    datasets = parse_zfs_datasets(run([
+        "zfs", "list", "-Hp", "-t", "filesystem", "-o",
+        "name,used,usedbydataset,usedbysnapshots,usedbychildren,referenced,compressratio",
+    ], timeout=10.0))
+    snapshots, snapshot_count, snapshot_used = parse_zfs_snapshots(run([
+        "zfs", "list", "-Hp", "-t", "snapshot", "-o", "name,used,referenced,creation",
+    ], timeout=10.0), SNAPSHOT_LIMIT)
+    shown = []
+    for dataset in datasets[:DATASET_LIMIT]:
+        entry = {"name": dataset["name"], "mount": mounts.get(dataset["name"], "")}
+        entry.update({key: value for key, value in dataset.items() if key != "name"})
+        shown.append(entry)
+    return {
+        "stamp": now,
+        "datasetCount": len(datasets),
+        "datasets": shown,
+        "snapshotCount": snapshot_count,
+        "snapshotUsed": snapshot_used,
+        "snapshots": snapshots,
+    }
+
+
 class DiskSampler:
     def __init__(self) -> None:
         self.prev: dict[str, tuple[int, int]] = {}
         self.volumes_cache: list[dict] = []
         self.volumes_stamp = 0.0
         self.drive_temps: dict[str, str] = {}
+        self.zfs_mounted = False
+        self.zfs_lock = threading.Lock()
+        self.zfs_value: dict | None = None
+        self.zfs_stamp = 0.0
+        self.zfs_inflight = False
         self._scan_drive_temps()
 
     def _scan_drive_temps(self) -> None:
@@ -879,7 +990,8 @@ class DiskSampler:
         mounts = [parts for parts in mounts if len(parts) >= 3]
         zfs_space: dict[str, tuple[int, int]] = {}
         zfs_leaves: dict[str, str] = {}
-        if any(zfs_pool(parts[2], parts[0]) for parts in mounts):
+        self.zfs_mounted = any(zfs_pool(parts[2], parts[0]) for parts in mounts)
+        if self.zfs_mounted:
             zfs_space = parse_zfs_space(run(["zfs", "list", "-Hp", "-d", "0", "-o", "name,used,avail"]))
             zfs_leaves = parse_zpool_leaves(run(["zpool", "list", "-HPv", "-o", "name"]))
         for parts in mounts:
@@ -935,7 +1047,29 @@ class DiskSampler:
         result = sorted(volumes.values(), key=lambda v: (v["mount"] != "/", v["mount"]))
         return result
 
-    def sample(self, elapsed: float, now: float) -> dict:
+    def _zfs_detail(self, now: float) -> dict | None:
+        """The cached dataset listing, starting a refresh in the background when
+        it is older than ZFS_DETAIL_SECONDS. None until the first one lands."""
+        with self.zfs_lock:
+            if not self.zfs_inflight and (self.zfs_stamp == 0 or now - self.zfs_stamp >= ZFS_DETAIL_SECONDS):
+                self.zfs_inflight = True
+
+                def worker() -> None:
+                    try:
+                        value = list_zfs_detail(time.time())
+                    except Exception:  # noqa: BLE001 - an unreadable listing stays unavailable
+                        value = None
+                    with self.zfs_lock:
+                        self.zfs_value = value
+                        self.zfs_stamp = time.time()
+                        self.zfs_inflight = False
+
+                threading.Thread(target=worker, daemon=True).start()
+            return self.zfs_value
+
+    def sample(self, elapsed: float, now: float, zfs_wanted: bool = False) -> dict:
+        """`zfs_wanted` is true while the Disks page is open; ZFS datasets and
+        snapshots are listed only then, and only when a dataset is mounted."""
         if now - self.volumes_stamp > 10:
             self.volumes_cache = self._volumes()
             self.volumes_stamp = now
@@ -978,6 +1112,7 @@ class DiskSampler:
             "read": total_read,
             "write": total_write,
             "perDisk": per_disk,
+            "zfs": self._zfs_detail(now) if zfs_wanted and self.zfs_mounted else None,
         }
 
 
@@ -1764,7 +1899,7 @@ def main() -> int:
             ("cpu", cpu.sample),
             ("gpus", gpu.sample_all),
             ("mem", sample_memory),
-            ("disks", lambda: disks.sample(elapsed, now)),
+            ("disks", lambda: disks.sample(elapsed, now, focus == "disks")),
             ("net", lambda: net.sample(elapsed, now, detail > 0)),
         ):
             try:
