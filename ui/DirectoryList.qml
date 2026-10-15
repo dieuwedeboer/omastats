@@ -40,9 +40,9 @@ Column {
     if (service && target) service.scanDirectory(target)
   }
 
-  function openInGdu() {
+  function openInDisktree() {
     if (!path) return
-    Util.execArgv(["omarchy-launch-tui", "/usr/bin/gdu", path])
+    Util.execArgv(["/usr/bin/disktree", path])
     if (host && typeof host.close === "function") host.close()
   }
 
@@ -106,11 +106,11 @@ Column {
       }
 
       TextAction {
-        visible: !!root.service && root.service.gduAvailable
-        text: "Open in gdu"
+        visible: !!root.service && root.service.disktreeAvailable
+        text: "Open in disktree"
         foreground: root.foreground
         fontFamily: root.fontFamily
-        onActivated: root.openInGdu()
+        onActivated: root.openInDisktree()
       }
 
       TextAction {

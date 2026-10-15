@@ -160,8 +160,8 @@ Item {
   property var scanResults: ({})
   property var scanRecords: []
   property real scanStarted: 0
-  property bool gduAvailable: false
-  property bool gduChecked: false
+  property bool disktreeAvailable: false
+  property bool disktreeChecked: false
   readonly property bool scanRunning: scanRunningPath !== ""
   readonly property var scanResult: scanResults[scanPath] || null
 
@@ -172,9 +172,9 @@ Item {
     if (!target || target.charAt(0) !== "/") return
     if (rootPath !== undefined) scanRoot = String(rootPath || target)
     scanPath = target
-    if (!gduChecked) {
-      gduChecked = true
-      gduCheck.running = true
+    if (!disktreeChecked) {
+      disktreeChecked = true
+      disktreeCheck.running = true
     }
     if (!force && scanResults[target]) return
     if (scanRunningPath === target) return
@@ -357,12 +357,12 @@ Item {
     onExited: function(code, status) { root.finishScan(code, status) }
   }
 
-  // gdu is offered for a closer look only when it is installed.
+  // Omarchy's disktree is offered for a closer look when it is installed.
   Process {
-    id: gduCheck
-    command: ["/usr/bin/test", "-x", "/usr/bin/gdu"]
+    id: disktreeCheck
+    command: ["/usr/bin/test", "-x", "/usr/bin/disktree"]
     clearEnvironment: true
-    onExited: function(code, status) { root.gduAvailable = code === 0 }
+    onExited: function(code, status) { root.disktreeAvailable = code === 0 }
   }
 
   Timer {

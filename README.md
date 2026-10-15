@@ -89,8 +89,9 @@ AMD and Intel come from sysfs), `ip` and `iw` (addresses, Wi-Fi signal),
 pool's space and the drive behind its first data vdev, shown as one volume at
 its shortest mount path; without them the space is that dataset's), `curl` (public IP lookup),
 `wl-copy` (copy an address), `xdg-open` (open a volume in your file manager),
-`du` from coreutils (directory sizes inside a ZFS dataset, on request), `gdu`
-(an "Open in gdu" link beside those sizes, shown only when `/usr/bin/gdu` exists).
+`du` from coreutils (directory sizes inside a ZFS dataset, on request), Omarchy's
+`disktree` (an "Open in disktree" link beside those sizes, shown only when
+`/usr/bin/disktree` exists).
 
 Nothing runs as root, and no data leaves the machine except the optional
 public-IP lookup, which you can switch off in Settings. That lookup tries
